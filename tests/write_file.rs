@@ -102,6 +102,62 @@ fn flush_file() {
     assert_eq!(entry.size, 64 * 3);
 }
 
+#[test]
+fn random_access_write_file() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    log::debug!("This is a debug log");
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let volume_mgr: VolumeManager<utils::RamDisk<Vec<u8>>, utils::TestTimeSource, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(0))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+
+    // Open with string
+    let f = volume_mgr
+        .open_file_in_dir(root_dir, "README.TXT", Mode::ReadWriteTruncate)
+        .expect("open file");
+
+    // Should be enough to cause a few more clusters to be allocated
+    let test_data = vec![0xCC; 1024 * 1024];
+    volume_mgr.write(f, &test_data).expect("file write");
+
+    let length = volume_mgr.file_length(f).expect("get length");
+    assert_eq!(length, 1024 * 1024);
+
+    let offset = volume_mgr.file_offset(f).expect("offset");
+    assert_eq!(offset, 1024 * 1024);
+
+    let mut expected_buffer = [0u8; 4];
+
+    // fetch some data at offset 0
+    volume_mgr.file_seek_from_start(f, 0).expect("Seeking");
+    volume_mgr.read(f, &mut expected_buffer).expect("read file");
+
+    // modify first byte
+    expected_buffer[0] = expected_buffer[0] ^ 0xff;
+
+    // write only first byte, expecting the rest to not change
+    volume_mgr.file_seek_from_start(f, 0).expect("Seeking");
+    volume_mgr
+        .write(f, &expected_buffer[0..1])
+        .expect("file write");
+    volume_mgr.flush_file(f).expect("file flush");
+
+    // read
+    volume_mgr.file_seek_from_start(f, 0).expect("file seek");
+    let mut read_buffer = [0xffu8, 0xff, 0xff, 0xff];
+    volume_mgr.read(f, &mut read_buffer).expect("file read");
+    println!("{read_buffer:?}, {expected_buffer:?}");
+    assert_eq!(read_buffer, expected_buffer);
+
+    volume_mgr.close_file(f).expect("close file");
+
+    volume_mgr.close_dir(root_dir).expect("close dir");
+    volume_mgr.close_volume(volume).expect("close volume");
+}
 // ****************************************************************************
 //
 // End Of File
