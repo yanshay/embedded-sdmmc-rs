@@ -103,7 +103,6 @@ fn flush_file() {
 }
 
 #[test]
-#[test]
 fn random_access_write_file() {
     let time_source = utils::make_time_source();
     let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
