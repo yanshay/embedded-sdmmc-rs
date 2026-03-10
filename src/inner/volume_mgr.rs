@@ -14,8 +14,8 @@ use heapless::Vec;
 use super::{
     fat,
     filesystem::{
-        Attributes, ClusterId, DirEntry, DirectoryInfo, FileInfo, HandleGenerator, LfnBuffer, Mode,
-        RawDirectory, RawFile, TimeSource, ToShortFileName, MAX_FILE_SIZE,
+        Attributes, ClusterId, DirEntry, DirectoryInfo, FileInfo, FilenameError, HandleGenerator,
+        LfnBuffer, Mode, RawDirectory, RawFile, TimeSource, ToShortFileName, MAX_FILE_SIZE,
     },
     Block, BlockCache, BlockCount, BlockDevice, BlockIdx, Error, RawVolume, ShortFileName, Volume,
     VolumeIdx, VolumeInfo, VolumeName, VolumeType, PARTITION_ID_FAT16, PARTITION_ID_FAT16_LBA,
@@ -1125,6 +1125,83 @@ where
                 .await?;
             }
         };
+
+        Ok(())
+    }
+
+    /// Rename a directory entry in a given directory.
+    ///
+    /// This only changes the entry short file name in-place. It does not move
+    /// the entry to another parent.
+    pub async fn rename_entry_in_dir<N, O>(
+        &self,
+        directory: RawDirectory,
+        old_name: N,
+        new_name: O,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+        O: ToShortFileName,
+    {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let dir_idx = data.get_dir_by_id(directory)?;
+        let dir_info = data.open_dirs[dir_idx].clone();
+        let volume_idx = data.get_volume_by_id(dir_info.raw_volume)?;
+        let old_sfn = old_name.to_short_filename().map_err(Error::FilenameError)?;
+        let new_sfn = new_name.to_short_filename().map_err(Error::FilenameError)?;
+
+        if old_sfn == ShortFileName::this_dir()
+            || old_sfn == ShortFileName::parent_dir()
+            || new_sfn == ShortFileName::this_dir()
+            || new_sfn == ShortFileName::parent_dir()
+        {
+            return Err(Error::FilenameError(FilenameError::InvalidCharacter));
+        }
+
+        let mut dir_entry = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.find_directory_entry(&mut data.block_cache, &dir_info, &old_sfn)
+                    .await?
+            }
+        };
+
+        if old_sfn == new_sfn {
+            return Ok(());
+        }
+
+        let maybe_dest_entry = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.find_directory_entry(&mut data.block_cache, &dir_info, &new_sfn)
+                    .await
+            }
+        };
+
+        match maybe_dest_entry {
+            Ok(entry) if entry.attributes.is_directory() => {
+                return Err(Error::DirAlreadyExists);
+            }
+            Ok(_) => {
+                return Err(Error::FileAlreadyExists);
+            }
+            Err(Error::NotFound) => {
+                // destination name is free
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
+        dir_entry.name = new_sfn;
+        dir_entry.mtime = self.time_source.get_timestamp();
+
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.write_entry_to_disk(&mut data.block_cache, &dir_entry)
+                    .await?;
+            }
+        }
 
         Ok(())
     }

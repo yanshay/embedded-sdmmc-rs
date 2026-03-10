@@ -231,6 +231,24 @@ where
             .await
     }
 
+    /// Rename a directory entry inside this directory.
+    ///
+    /// This only changes the short file name in-place and does not move the
+    /// entry to another parent.
+    pub async fn rename_entry_in_dir<N, O>(
+        &self,
+        old_name: N,
+        new_name: O,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+        O: ToShortFileName,
+    {
+        self.volume_mgr
+            .rename_entry_in_dir(self.raw_directory, old_name, new_name)
+            .await
+    }
+
     /// Convert back to a raw directory
     pub fn to_raw_directory(self) -> RawDirectory {
         let d = self.raw_directory;

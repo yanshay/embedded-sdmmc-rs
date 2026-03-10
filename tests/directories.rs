@@ -1,7 +1,7 @@
 //! Directory related tests
 
 use embedded_sdmmc::blocking::{
-    DirEntry, Error, LfnBuffer, Mode, ShortFileName, VolumeIdx, VolumeManager,
+    DirEntry, Error, FilenameError, LfnBuffer, Mode, ShortFileName, VolumeIdx, VolumeManager,
 };
 
 mod utils;
@@ -583,6 +583,153 @@ fn make_directory() {
     volume_mgr.close_dir(root_dir).expect("close root");
     volume_mgr.close_dir(new_dir).expect("close new dir");
     volume_mgr.close_file(new_file).expect("close file");
+}
+
+#[test]
+fn rename_directory() {
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let volume_mgr = VolumeManager::new(disk, time_source);
+
+    let fat32_volume = volume_mgr
+        .open_raw_volume(VolumeIdx(1))
+        .expect("open volume 1");
+
+    let root_dir = volume_mgr
+        .open_root_dir(fat32_volume)
+        .expect("open root dir");
+
+    let test_dir = volume_mgr.open_dir(root_dir, "TEST").expect("open test");
+
+    volume_mgr
+        .rename_entry_in_dir(root_dir, "TEST", "RENAMED")
+        .expect("rename dir");
+
+    assert!(matches!(
+        volume_mgr.open_dir(root_dir, "TEST"),
+        Err(Error::NotFound)
+    ));
+
+    let renamed_dir = volume_mgr
+        .open_dir(root_dir, "RENAMED")
+        .expect("open renamed dir");
+
+    let mut found_in_old_handle = false;
+    volume_mgr
+        .iterate_dir(test_dir, |d| {
+            if d.name == ShortFileName::create_from_str("TEST.DAT").unwrap() {
+                found_in_old_handle = true;
+            }
+        })
+        .expect("iterate old handle");
+    assert!(found_in_old_handle);
+
+    let mut found_in_new_handle = false;
+    volume_mgr
+        .iterate_dir(renamed_dir, |d| {
+            if d.name == ShortFileName::create_from_str("TEST.DAT").unwrap() {
+                found_in_new_handle = true;
+            }
+        })
+        .expect("iterate new handle");
+    assert!(found_in_new_handle);
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "README.TXT", "SOMEDIR"),
+        Ok(())
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "RENAMED", "EMPTY.DAT"),
+        Err(Error::FileAlreadyExists)
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "RENAMED", "FSEVEN~4"),
+        Err(Error::DirAlreadyExists)
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "RENAMED", "RENAMED"),
+        Ok(())
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, ".", "OTHER"),
+        Err(Error::FilenameError(FilenameError::InvalidCharacter))
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "RENAMED", ".."),
+        Err(Error::FilenameError(FilenameError::InvalidCharacter))
+    ));
+
+    volume_mgr.close_dir(test_dir).expect("close old handle");
+    volume_mgr.close_dir(renamed_dir).expect("close new handle");
+    volume_mgr.close_dir(root_dir).expect("close root dir");
+}
+
+#[test]
+fn rename_file() {
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let volume_mgr = VolumeManager::new(disk, time_source);
+
+    let fat32_volume = volume_mgr
+        .open_raw_volume(VolumeIdx(1))
+        .expect("open volume 1");
+
+    let root_dir = volume_mgr
+        .open_root_dir(fat32_volume)
+        .expect("open root dir");
+
+    volume_mgr
+        .rename_entry_in_dir(root_dir, "README.TXT", "README2.TXT")
+        .expect("rename file");
+
+    assert!(matches!(
+        volume_mgr.open_file_in_dir(root_dir, "README.TXT", Mode::ReadOnly),
+        Err(Error::NotFound)
+    ));
+
+    let renamed_file = volume_mgr
+        .open_file_in_dir(root_dir, "README2.TXT", Mode::ReadOnly)
+        .expect("open renamed file");
+    volume_mgr
+        .close_file(renamed_file)
+        .expect("close renamed file");
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "TEST", "TEST2"),
+        Ok(())
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "README2.TXT", "EMPTY.DAT"),
+        Err(Error::FileAlreadyExists)
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "README2.TXT", "FSEVEN~4"),
+        Err(Error::DirAlreadyExists)
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "README2.TXT", "README2.TXT"),
+        Ok(())
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, ".", "OTHER.TXT"),
+        Err(Error::FilenameError(FilenameError::InvalidCharacter))
+    ));
+
+    assert!(matches!(
+        volume_mgr.rename_entry_in_dir(root_dir, "README2.TXT", ".."),
+        Err(Error::FilenameError(FilenameError::InvalidCharacter))
+    ));
+
+    volume_mgr.close_dir(root_dir).expect("close root dir");
 }
 
 // ****************************************************************************
