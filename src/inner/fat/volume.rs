@@ -836,7 +836,8 @@ impl FatVolume {
                                 first_dir_block_num = self.cluster_to_block(n);
                                 Some(n)
                             }
-                            _ => None,
+                            Err(Error::EndOfFile) => None,
+                            Err(e) => return Err(e),
                         };
                     } else {
                         current_cluster = None;
@@ -862,7 +863,8 @@ impl FatVolume {
                     }
                     current_cluster = match self.next_cluster(block_cache, cluster).await {
                         Ok(n) => Some(n),
-                        _ => None,
+                        Err(Error::EndOfFile) => None,
+                        Err(e) => return Err(e),
                     }
                 }
                 Err(Error::NotFound)
@@ -1465,8 +1467,102 @@ where
 }
 
 #[cfg(test)]
+#[allow(unused_imports, dead_code)]
 mod tests {
+    use super::super::super::super::only_sync;
+    use super::super::super::{filesystem::Handle, RawDirectory, RawVolume};
     use super::*;
+
+    #[derive(Debug)]
+    enum TestBlockDeviceError {
+        InjectedRead,
+    }
+
+    struct FatReadErrorBlockDevice;
+
+    #[only_sync]
+    impl BlockDevice for FatReadErrorBlockDevice {
+        type Error = TestBlockDeviceError;
+
+        fn read(&self, blocks: &mut [Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
+            if start_block_idx == BlockIdx(1) {
+                return Err(TestBlockDeviceError::InjectedRead);
+            }
+
+            for block in blocks {
+                block.fill(0);
+            }
+            Ok(())
+        }
+
+        fn write(&self, _blocks: &[Block], _start_block_idx: BlockIdx) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
+            Ok(BlockCount(64))
+        }
+    }
+
+    fn test_volume(fat_specific_info: FatSpecificInfo) -> FatVolume {
+        FatVolume {
+            lba_start: BlockIdx(0),
+            num_blocks: BlockCount(64),
+            name: VolumeName {
+                contents: [b' '; 11],
+            },
+            blocks_per_cluster: 1,
+            first_data_block: BlockCount(10),
+            fat_start: BlockCount(1),
+            second_fat_start: None,
+            free_clusters_count: None,
+            next_free_cluster: None,
+            cluster_count: 16,
+            fat_specific_info,
+        }
+    }
+
+    fn test_directory_info(cluster: ClusterId) -> DirectoryInfo {
+        DirectoryInfo {
+            raw_directory: RawDirectory(Handle(1)),
+            raw_volume: RawVolume(Handle(2)),
+            cluster,
+        }
+    }
+
+    #[only_sync]
+    #[test]
+    fn find_directory_entry_propagates_fat16_next_cluster_errors() {
+        let volume = test_volume(FatSpecificInfo::Fat16(Fat16Info {
+            root_entries_count: 512,
+            first_root_dir_block: BlockCount(20),
+        }));
+        let mut block_cache = BlockCache::new(FatReadErrorBlockDevice);
+        let dir_info = test_directory_info(ClusterId(2));
+        let name = ShortFileName::create_from_str("MISSING.TXT").unwrap();
+
+        assert!(matches!(
+            volume.find_directory_entry(&mut block_cache, &dir_info, &name),
+            Err(Error::DeviceError(TestBlockDeviceError::InjectedRead))
+        ));
+    }
+
+    #[only_sync]
+    #[test]
+    fn find_directory_entry_propagates_fat32_next_cluster_errors() {
+        let volume = test_volume(FatSpecificInfo::Fat32(Fat32Info {
+            info_location: BlockIdx(2),
+            first_root_dir_cluster: ClusterId(2),
+        }));
+        let mut block_cache = BlockCache::new(FatReadErrorBlockDevice);
+        let dir_info = test_directory_info(ClusterId(2));
+        let name = ShortFileName::create_from_str("MISSING.TXT").unwrap();
+
+        assert!(matches!(
+            volume.find_directory_entry(&mut block_cache, &dir_info, &name),
+            Err(Error::DeviceError(TestBlockDeviceError::InjectedRead))
+        ));
+    }
 
     #[test]
     fn volume_name() {

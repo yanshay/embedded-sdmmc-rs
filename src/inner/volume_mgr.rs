@@ -527,7 +527,7 @@ where
                 // we are opening an existing file
                 Some(entry)
             }
-            Err(_)
+            Err(Error::NotFound)
                 if (mode == Mode::ReadWriteCreate)
                     | (mode == Mode::ReadWriteCreateOrTruncate)
                     | (mode == Mode::ReadWriteCreateOrAppend) =>
@@ -536,10 +536,11 @@ where
                 // asked us to create it
                 None
             }
-            _ => {
+            Err(Error::NotFound) => {
                 // We are opening a non-existant file, and that's not OK.
                 return Err(Error::NotFound);
             }
+            Err(e) => return Err(e),
         };
 
         // Check if it's open already
