@@ -954,6 +954,163 @@ where
         Ok(())
     }
 
+    /// Write whole blocks to an open file using multi-block device operations.
+    ///
+    /// The file offset must be aligned to [`Block::LEN`]. Writes are split at
+    /// FAT cluster boundaries because adjacent file clusters need not be
+    /// physically contiguous. This operation is not transactional: if a later
+    /// allocation or device operation fails, an earlier successfully written
+    /// prefix remains in the file.
+    pub async fn write_blocks(
+        &self,
+        file: RawFile,
+        blocks: &[Block],
+    ) -> Result<(), Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let file_idx = data.get_file_by_id(file)?;
+        let volume_idx = data.get_volume_by_id(data.open_files[file_idx].raw_volume)?;
+
+        if data.open_files[file_idx].mode == Mode::ReadOnly {
+            return Err(Error::ReadOnly);
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let initial_offset = data.open_files[file_idx].current_offset;
+        if initial_offset % Block::LEN_U32 != 0 {
+            return Err(Error::InvalidOffset);
+        }
+        let block_count = u32::try_from(blocks.len()).map_err(|_| Error::ConversionError)?;
+        let byte_count = block_count
+            .checked_mul(Block::LEN_U32)
+            .ok_or(Error::ConversionError)?;
+        let final_offset = initial_offset
+            .checked_add(byte_count)
+            .ok_or(Error::InvalidOffset)?;
+        if final_offset > MAX_FILE_SIZE {
+            return Err(Error::InvalidOffset);
+        }
+
+        data.open_files[file_idx].dirty = true;
+
+        if data.open_files[file_idx].entry.cluster.0 < fat::RESERVED_ENTRIES {
+            data.open_files[file_idx].entry.cluster =
+                match data.open_volumes[volume_idx].volume_type {
+                    VolumeType::Fat(ref mut fat) => {
+                        fat.alloc_cluster(&mut data.block_cache, None, false)
+                            .await?
+                    }
+                };
+            debug!(
+                "Alloc first cluster {:?}",
+                data.open_files[file_idx].entry.cluster
+            );
+        }
+
+        let volume_idx = data.get_volume_by_id(data.open_files[file_idx].raw_volume)?;
+        if data.open_files[file_idx].current_cluster.1 < data.open_files[file_idx].entry.cluster {
+            data.open_files[file_idx].current_cluster =
+                (0, data.open_files[file_idx].entry.cluster);
+        }
+
+        let bytes_per_cluster = match data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(ref fat) => fat.bytes_per_cluster(),
+        };
+        let mut written_blocks = 0_usize;
+
+        while written_blocks < blocks.len() {
+            let mut current_cluster = data.open_files[file_idx].current_cluster;
+            let current_offset = data.open_files[file_idx].current_offset;
+            let (block_idx, block_offset, block_avail) = match data
+                .find_data_on_disk(
+                    volume_idx,
+                    &mut current_cluster,
+                    data.open_files[file_idx].entry.cluster,
+                    current_offset,
+                )
+                .await
+            {
+                Ok(vars) => vars,
+                Err(Error::EndOfFile) => {
+                    match data.open_volumes[volume_idx].volume_type {
+                        VolumeType::Fat(ref mut fat) => {
+                            if fat
+                                .alloc_cluster(
+                                    &mut data.block_cache,
+                                    Some(current_cluster.1),
+                                    false,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                return Err(Error::DiskFull);
+                            }
+                        }
+                    }
+                    data.find_data_on_disk(
+                        volume_idx,
+                        &mut current_cluster,
+                        data.open_files[file_idx].entry.cluster,
+                        current_offset,
+                    )
+                    .await
+                    .map_err(|_| Error::AllocationError)?
+                }
+                Err(err) => return Err(err),
+            };
+
+            if block_offset != 0 || block_avail != Block::LEN {
+                return Err(Error::FormatError("unaligned block write"));
+            }
+            let offset_in_cluster = current_offset
+                .checked_sub(current_cluster.0)
+                .ok_or(Error::FormatError("invalid cached cluster offset"))?;
+            if offset_in_cluster >= bytes_per_cluster || offset_in_cluster % Block::LEN_U32 != 0 {
+                return Err(Error::FormatError("invalid block offset within cluster"));
+            }
+            let blocks_left_in_cluster =
+                usize::try_from((bytes_per_cluster - offset_in_cluster) / Block::LEN_U32)
+                    .map_err(|_| Error::ConversionError)?;
+            let run_len = core::cmp::min(blocks_left_in_cluster, blocks.len() - written_blocks);
+            if run_len == 0 {
+                return Err(Error::FormatError("empty block write run"));
+            }
+
+            debug!(
+                "Writing {} blocks at {:?} for file {:?}",
+                run_len, block_idx, file
+            );
+            data.block_cache
+                .block_device()
+                .write(&blocks[written_blocks..written_blocks + run_len], block_idx)
+                .await
+                .map_err(Error::DeviceError)?;
+
+            written_blocks += run_len;
+            data.open_files[file_idx].current_cluster = current_cluster;
+            let run_bytes = u32::try_from(run_len)
+                .map_err(|_| Error::ConversionError)?
+                .checked_mul(Block::LEN_U32)
+                .ok_or(Error::ConversionError)?;
+            let new_offset = current_offset
+                .checked_add(run_bytes)
+                .ok_or(Error::InvalidOffset)?;
+            if new_offset > data.open_files[file_idx].entry.size {
+                data.open_files[file_idx].update_length(new_offset);
+            }
+            data.open_files[file_idx]
+                .seek_from_start(new_offset)
+                .map_err(|_| Error::InvalidOffset)?;
+        }
+
+        data.open_files[file_idx].entry.attributes.set_archive(true);
+        data.open_files[file_idx].entry.mtime = self.time_source.get_timestamp();
+        Ok(())
+    }
+
     /// Close a file with the given raw file handle.
     pub async fn close_file(&self, file: RawFile) -> Result<(), Error<D::Error>> {
         let flush_result = self.flush_file(file).await;

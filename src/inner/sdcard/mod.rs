@@ -246,6 +246,10 @@ where
 
     /// Write one or more blocks, starting at the given block index.
     async fn write(&mut self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Error> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
         let start_idx = match self.card_type {
             Some(CardType::SD1 | CardType::SD2) => start_block_idx.0 * 512,
             Some(CardType::SDHC) => start_block_idx.0,
@@ -271,14 +275,33 @@ where
 
             // Start a multi-block write
             self.card_command(CMD25, start_idx).await?;
+            let mut write_result = Ok(());
             for block in blocks.iter() {
-                self.wait_not_busy(Delay::new_write()).await?;
-                self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents)
-                    .await?;
+                if let Err(err) = self.wait_not_busy(Delay::new_write()).await {
+                    write_result = Err(err);
+                    break;
+                }
+                if let Err(err) = self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents).await {
+                    write_result = Err(err);
+                    break;
+                }
             }
-            // Stop the write
-            self.wait_not_busy(Delay::new_write()).await?;
-            self.write_byte(STOP_TRAN_TOKEN).await?;
+
+            // Always attempt to terminate CMD25, including after a rejected block.
+            let ready_before_stop = self.wait_not_busy(Delay::new_write()).await;
+            let stop_result = self.write_byte(STOP_TRAN_TOKEN).await;
+            let ready_after_stop = self.wait_not_busy(Delay::new_write()).await;
+            let status_result = match self.card_command(CMD13, 0).await {
+                Ok(response) if response[0] == 0x00 && response[1] == 0x00 => Ok(()),
+                Ok(_) => Err(Error::WriteError),
+                Err(err) => Err(err),
+            };
+
+            write_result?;
+            ready_before_stop?;
+            stop_result?;
+            ready_after_stop?;
+            status_result?;
         }
         Ok(())
     }
