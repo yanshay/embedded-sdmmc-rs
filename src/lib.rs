@@ -115,13 +115,26 @@ compile_error!("Cannot enable both log and defmt-log");
 #[cfg(feature = "log")]
 use log::{debug, trace, warn};
 
+#[cfg(all(feature = "log", feature = "sd-ota-diagnostics"))]
+use log::info;
+
 #[cfg(feature = "defmt-log")]
 use defmt::{debug, trace, warn};
+
+#[cfg(all(feature = "defmt-log", feature = "sd-ota-diagnostics"))]
+use defmt::info;
 
 #[cfg(all(not(feature = "defmt-log"), not(feature = "log")))]
 #[macro_export]
 /// Like log::debug! but does nothing at all
 macro_rules! debug {
+    ($($arg:tt)+) => {};
+}
+
+#[cfg(all(not(feature = "defmt-log"), not(feature = "log")))]
+#[macro_export]
+/// Like log::info! but does nothing at all
+macro_rules! info {
     ($($arg:tt)+) => {};
 }
 

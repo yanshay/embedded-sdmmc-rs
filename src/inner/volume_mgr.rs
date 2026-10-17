@@ -24,6 +24,44 @@ use super::{
 
 use crate::{debug, trace};
 
+/// Diagnostics describing how one bulk file write reached the block device.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteBlocksStats {
+    /// Number of 512-byte blocks requested by the caller.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub requested_blocks: u32,
+    /// Number of 512-byte blocks in one FAT cluster.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub blocks_per_cluster: u32,
+    /// Number of data-write calls made to the block device.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub device_writes: u32,
+    /// Number of device writes containing exactly one block.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub single_block_writes: u32,
+    /// Number of device writes containing more than one block.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub multi_block_writes: u32,
+    /// Smallest number of blocks in a device write.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub min_blocks_per_write: u32,
+    /// Largest number of blocks in a device write.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub max_blocks_per_write: u32,
+    /// Number of clusters allocated while handling the request.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub allocated_clusters: u32,
+    /// Number of device-write boundaries whose physical blocks were adjacent.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub contiguous_boundaries: u32,
+    /// Number of device-write boundaries separated by fragmentation.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub fragmented_boundaries: u32,
+    /// Number of device writes needed if adjacent runs were coalesced.
+    #[cfg(feature = "sd-ota-diagnostics")]
+    pub coalesced_device_writes: u32,
+}
+
 /// Wraps a block device and gives access to the FAT-formatted volumes within
 /// it.
 ///
@@ -965,7 +1003,7 @@ where
         &self,
         file: RawFile,
         blocks: &[Block],
-    ) -> Result<(), Error<D::Error>> {
+    ) -> Result<WriteBlocksStats, Error<D::Error>> {
         let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
         let data = data.deref_mut();
 
@@ -976,7 +1014,7 @@ where
             return Err(Error::ReadOnly);
         }
         if blocks.is_empty() {
-            return Ok(());
+            return Ok(WriteBlocksStats::default());
         }
 
         let initial_offset = data.open_files[file_idx].current_offset;
@@ -996,6 +1034,8 @@ where
 
         data.open_files[file_idx].dirty = true;
 
+        #[cfg(feature = "sd-ota-diagnostics")]
+        let mut allocated_clusters = 0_u32;
         if data.open_files[file_idx].entry.cluster.0 < fat::RESERVED_ENTRIES {
             data.open_files[file_idx].entry.cluster =
                 match data.open_volumes[volume_idx].volume_type {
@@ -1004,6 +1044,10 @@ where
                             .await?
                     }
                 };
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                allocated_clusters += 1;
+            }
             debug!(
                 "Alloc first cluster {:?}",
                 data.open_files[file_idx].entry.cluster
@@ -1020,6 +1064,16 @@ where
             VolumeType::Fat(ref fat) => fat.bytes_per_cluster(),
         };
         let mut written_blocks = 0_usize;
+        #[cfg(feature = "sd-ota-diagnostics")]
+        let mut stats = WriteBlocksStats {
+            requested_blocks: block_count,
+            blocks_per_cluster: bytes_per_cluster / Block::LEN_U32,
+            min_blocks_per_write: u32::MAX,
+            allocated_clusters,
+            ..WriteBlocksStats::default()
+        };
+        #[cfg(feature = "sd-ota-diagnostics")]
+        let mut previous_write_end = None;
 
         while written_blocks < blocks.len() {
             let mut current_cluster = data.open_files[file_idx].current_cluster;
@@ -1047,6 +1101,10 @@ where
                                 .is_err()
                             {
                                 return Err(Error::DiskFull);
+                            }
+                            #[cfg(feature = "sd-ota-diagnostics")]
+                            {
+                                stats.allocated_clusters += 1;
                             }
                         }
                     }
@@ -1079,6 +1137,32 @@ where
                 return Err(Error::FormatError("empty block write run"));
             }
 
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                let run_len_u32 = u32::try_from(run_len).map_err(|_| Error::ConversionError)?;
+                if let Some(previous_end) = previous_write_end {
+                    if previous_end == block_idx.0 {
+                        stats.contiguous_boundaries += 1;
+                    } else {
+                        stats.fragmented_boundaries += 1;
+                    }
+                }
+                previous_write_end = Some(
+                    block_idx
+                        .0
+                        .checked_add(run_len_u32)
+                        .ok_or(Error::InvalidOffset)?,
+                );
+                stats.device_writes += 1;
+                if run_len == 1 {
+                    stats.single_block_writes += 1;
+                } else {
+                    stats.multi_block_writes += 1;
+                }
+                stats.min_blocks_per_write = stats.min_blocks_per_write.min(run_len_u32);
+                stats.max_blocks_per_write = stats.max_blocks_per_write.max(run_len_u32);
+            }
+
             debug!(
                 "Writing {} blocks at {:?} for file {:?}",
                 run_len, block_idx, file
@@ -1108,7 +1192,17 @@ where
 
         data.open_files[file_idx].entry.attributes.set_archive(true);
         data.open_files[file_idx].entry.mtime = self.time_source.get_timestamp();
-        Ok(())
+        #[cfg(feature = "sd-ota-diagnostics")]
+        {
+            stats.coalesced_device_writes = stats
+                .device_writes
+                .saturating_sub(stats.contiguous_boundaries);
+            return Ok(stats);
+        }
+        #[cfg(not(feature = "sd-ota-diagnostics"))]
+        {
+            return Ok(WriteBlocksStats::default());
+        }
     }
 
     /// Truncate an open file using batched FAT-sector updates.

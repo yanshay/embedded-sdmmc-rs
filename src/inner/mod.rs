@@ -43,7 +43,7 @@ pub use sdcard::SdCard;
 
 mod volume_mgr;
 #[doc(inline)]
-pub use volume_mgr::VolumeManager;
+pub use volume_mgr::{VolumeManager, WriteBlocksStats};
 
 // ****************************************************************************
 //

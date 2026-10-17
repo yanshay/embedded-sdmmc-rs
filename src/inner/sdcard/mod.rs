@@ -15,6 +15,8 @@ use proto::*;
 // Imports
 // ****************************************************************************
 
+#[cfg(feature = "sd-ota-diagnostics")]
+use crate::info;
 use crate::{debug, trace, warn};
 
 // ****************************************************************************
@@ -23,6 +25,25 @@ use crate::{debug, trace, warn};
 
 /// The max number of bytes in a command response.
 const COMMAND_RESPONSE_BYTES: usize = 5;
+#[cfg(feature = "sd-ota-diagnostics")]
+const WRITE_DIAGNOSTIC_REPORT_INTERVAL: u32 = 32;
+
+#[cfg(feature = "sd-ota-diagnostics")]
+#[derive(Default)]
+struct WriteDiagnostics {
+    device_writes: u32,
+    cmd24_writes: u32,
+    cmd25_writes: u32,
+    blocks: u32,
+    busy_waits: u32,
+    busy_polls: u32,
+    max_busy_polls: u32,
+}
+
+#[cfg(feature = "sd-ota-diagnostics")]
+type BusyPollCount = u32;
+#[cfg(not(feature = "sd-ota-diagnostics"))]
+type BusyPollCount = ();
 
 /// Driver for an SD Card on an SPI bus.
 ///
@@ -82,6 +103,8 @@ where
                 delayer,
                 card_type: None,
                 options,
+                #[cfg(feature = "sd-ota-diagnostics")]
+                write_diagnostics: WriteDiagnostics::default(),
             }),
         }
     }
@@ -212,6 +235,8 @@ where
     delayer: DELAYER,
     card_type: Option<CardType>,
     options: AcquireOpts,
+    #[cfg(feature = "sd-ota-diagnostics")]
+    write_diagnostics: WriteDiagnostics,
 }
 
 #[bisync]
@@ -260,26 +285,52 @@ where
             self.card_command(CMD24, start_idx).await?;
             self.write_data(DATA_START_BLOCK, &blocks[0].contents)
                 .await?;
-            self.wait_not_busy(Delay::new_write()).await?;
+            let _busy_polls = self.wait_not_busy(Delay::new_write()).await?;
             let response = self.card_command(CMD13, 0).await?;
             if response[0] != 0x00 || response[1] != 0x00 {
                 return Err(Error::WriteError);
             }
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                self.record_write_diagnostics(false, 1, 1, _busy_polls, _busy_polls);
+            }
         } else {
+            #[cfg(feature = "sd-ota-diagnostics")]
+            let mut busy_waits = 0_u32;
+            #[cfg(feature = "sd-ota-diagnostics")]
+            let mut busy_polls = 0_u32;
+            #[cfg(feature = "sd-ota-diagnostics")]
+            let mut max_busy_polls = 0_u32;
             // > It is recommended using this command preceding CMD25, some of the cards will be faster for Multiple
             // > Write Blocks operation. Note that the host should send ACMD23 just before WRITE command if the host
             // > wants to use the pre-erased feature
             self.card_acmd(ACMD23, blocks.len() as u32).await?;
             // wait for card to be ready before sending the next command
-            self.wait_not_busy(Delay::new_write()).await?;
+            let _polls = self.wait_not_busy(Delay::new_write()).await?;
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                busy_waits += 1;
+                busy_polls += _polls;
+                max_busy_polls = max_busy_polls.max(_polls);
+            }
 
             // Start a multi-block write
             self.card_command(CMD25, start_idx).await?;
             let mut write_result = Ok(());
             for block in blocks.iter() {
-                if let Err(err) = self.wait_not_busy(Delay::new_write()).await {
-                    write_result = Err(err);
-                    break;
+                match self.wait_not_busy(Delay::new_write()).await {
+                    Ok(_polls) => {
+                        #[cfg(feature = "sd-ota-diagnostics")]
+                        {
+                            busy_waits += 1;
+                            busy_polls += _polls;
+                            max_busy_polls = max_busy_polls.max(_polls);
+                        }
+                    }
+                    Err(err) => {
+                        write_result = Err(err);
+                        break;
+                    }
                 }
                 if let Err(err) = self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents).await {
                     write_result = Err(err);
@@ -289,8 +340,24 @@ where
 
             // Always attempt to terminate CMD25, including after a rejected block.
             let ready_before_stop = self.wait_not_busy(Delay::new_write()).await;
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                if let Ok(polls) = ready_before_stop {
+                    busy_waits += 1;
+                    busy_polls += polls;
+                    max_busy_polls = max_busy_polls.max(polls);
+                }
+            }
             let stop_result = self.write_byte(STOP_TRAN_TOKEN).await;
             let ready_after_stop = self.wait_not_busy(Delay::new_write()).await;
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                if let Ok(polls) = ready_after_stop {
+                    busy_waits += 1;
+                    busy_polls += polls;
+                    max_busy_polls = max_busy_polls.max(polls);
+                }
+            }
             let status_result = match self.card_command(CMD13, 0).await {
                 Ok(response) if response[0] == 0x00 && response[1] == 0x00 => Ok(()),
                 Ok(_) => Err(Error::WriteError),
@@ -302,8 +369,54 @@ where
             stop_result?;
             ready_after_stop?;
             status_result?;
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                self.record_write_diagnostics(
+                    true,
+                    blocks.len() as u32,
+                    busy_waits,
+                    busy_polls,
+                    max_busy_polls,
+                );
+            }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "sd-ota-diagnostics")]
+    fn record_write_diagnostics(
+        &mut self,
+        multi_block: bool,
+        blocks: u32,
+        busy_waits: u32,
+        busy_polls: u32,
+        max_busy_polls: u32,
+    ) {
+        self.write_diagnostics.device_writes += 1;
+        if multi_block {
+            self.write_diagnostics.cmd25_writes += 1;
+        } else {
+            self.write_diagnostics.cmd24_writes += 1;
+        }
+        self.write_diagnostics.blocks += blocks;
+        self.write_diagnostics.busy_waits += busy_waits;
+        self.write_diagnostics.busy_polls += busy_polls;
+        self.write_diagnostics.max_busy_polls =
+            self.write_diagnostics.max_busy_polls.max(max_busy_polls);
+
+        if self.write_diagnostics.device_writes >= WRITE_DIAGNOSTIC_REPORT_INTERVAL {
+            info!(
+                "SD write counters: device_writes={} cmd24={} cmd25={} blocks={} busy_waits={} busy_polls={} max_busy_polls={}",
+                self.write_diagnostics.device_writes,
+                self.write_diagnostics.cmd24_writes,
+                self.write_diagnostics.cmd25_writes,
+                self.write_diagnostics.blocks,
+                self.write_diagnostics.busy_waits,
+                self.write_diagnostics.busy_polls,
+                self.write_diagnostics.max_busy_polls,
+            );
+            self.write_diagnostics = WriteDiagnostics::default();
+        }
     }
 
     /// Determine how many blocks this device can hold.
@@ -604,17 +717,30 @@ where
 
     /// Spin until the card returns 0xFF, or we spin too many times and
     /// timeout.
-    async fn wait_not_busy(&mut self, mut delay: Delay) -> Result<(), Error> {
+    async fn wait_not_busy(&mut self, mut delay: Delay) -> Result<BusyPollCount, Error> {
+        #[cfg(feature = "sd-ota-diagnostics")]
+        let mut busy_polls = 0_u32;
         loop {
             let s = self.read_byte().await?;
             if s == 0xFF {
                 break;
             }
+            #[cfg(feature = "sd-ota-diagnostics")]
+            {
+                busy_polls += 1;
+            }
             delay
                 .delay(&mut self.delayer, Error::TimeoutWaitNotBusy)
                 .await?;
         }
-        Ok(())
+        #[cfg(feature = "sd-ota-diagnostics")]
+        {
+            return Ok(busy_polls);
+        }
+        #[cfg(not(feature = "sd-ota-diagnostics"))]
+        {
+            return Ok(());
+        }
     }
 }
 

@@ -229,7 +229,7 @@ fn bulk_write_uses_multiblock_requests_and_supports_byte_tail() {
             *byte = (block_index as u8).wrapping_mul(17) ^ byte_index as u8;
         }
     }
-    volume_mgr
+    let _stats = volume_mgr
         .write_blocks(file, &blocks)
         .expect("bulk file write");
     let tail = [0xA5; 37];
@@ -239,6 +239,20 @@ fn bulk_write_uses_multiblock_requests_and_supports_byte_tail() {
         writes.borrow().iter().any(|(_, count)| *count > 1),
         "bulk write never reached the block device"
     );
+    #[cfg(feature = "sd-ota-diagnostics")]
+    {
+        assert_eq!(_stats.requested_blocks, 10);
+        assert_eq!(_stats.blocks_per_cluster, 4);
+        assert_eq!(_stats.device_writes, 3);
+        assert_eq!(_stats.single_block_writes, 0);
+        assert_eq!(_stats.multi_block_writes, 3);
+        assert_eq!(_stats.min_blocks_per_write, 2);
+        assert_eq!(_stats.max_blocks_per_write, 4);
+        assert_eq!(_stats.allocated_clusters, 3);
+        assert_eq!(_stats.contiguous_boundaries, 1);
+        assert_eq!(_stats.fragmented_boundaries, 1);
+        assert_eq!(_stats.coalesced_device_writes, 2);
+    }
     assert_eq!(
         volume_mgr.file_offset(file).expect("file offset"),
         (blocks.len() * Block::LEN + tail.len()) as u32
@@ -326,7 +340,7 @@ fn bulk_write_follows_fragmented_cluster_chain() {
 
     writes.borrow_mut().clear();
     let replacement = vec![Block::new(); 8];
-    volume_mgr
+    let _stats = volume_mgr
         .write_blocks(target, &replacement)
         .expect("overwrite fragmented file");
 
@@ -340,6 +354,13 @@ fn bulk_write_follows_fragmented_cluster_chain() {
     assert_eq!(data_writes[0].1, 4);
     assert_eq!(data_writes[1].1, 4);
     assert_ne!(data_writes[1].0 .0, data_writes[0].0 .0 + 4);
+    #[cfg(feature = "sd-ota-diagnostics")]
+    {
+        assert_eq!(_stats.device_writes, 2);
+        assert_eq!(_stats.contiguous_boundaries, 0);
+        assert_eq!(_stats.fragmented_boundaries, 1);
+        assert_eq!(_stats.coalesced_device_writes, 2);
+    }
 }
 
 #[test]
