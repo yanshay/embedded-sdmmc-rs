@@ -341,6 +341,131 @@ fn bulk_write_follows_fragmented_cluster_chain() {
     assert_eq!(data_writes[1].1, 4);
     assert_ne!(data_writes[1].0 .0, data_writes[0].0 .0 + 4);
 }
+
+#[test]
+fn truncate_batches_updates_by_fat_sector() {
+    let time_source = utils::make_time_source();
+    let (disk, writes) = make_recording_device();
+    let volume_mgr: VolumeManager<_, _, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(0))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    let file = volume_mgr
+        .open_file_in_dir(root_dir, "EMPTY.DAT", Mode::ReadWriteTruncate)
+        .expect("open file");
+
+    // FAT16 has four blocks per cluster in the test image. This creates 300
+    // clusters, enough FAT entries to span multiple 512-byte FAT sectors.
+    let blocks = vec![Block::new(); 300 * 4];
+    volume_mgr
+        .write_blocks(file, &blocks)
+        .expect("write multi-sector FAT chain");
+    volume_mgr.close_file(file).expect("close file");
+
+    writes.borrow_mut().clear();
+    let file = volume_mgr
+        .open_file_in_dir(root_dir, "EMPTY.DAT", Mode::ReadWriteAppend)
+        .expect("open file for batched truncation");
+    volume_mgr
+        .truncate_file_batched(file)
+        .expect("truncate file");
+    assert_eq!(volume_mgr.file_length(file).expect("file length"), 0);
+    volume_mgr.close_file(file).expect("close truncated file");
+    assert_eq!(
+        volume_mgr
+            .find_directory_entry(root_dir, "EMPTY.DAT")
+            .expect("find truncated file")
+            .size,
+        0
+    );
+
+    let truncate_writes = writes.borrow();
+    assert!(
+        truncate_writes.len() < 16,
+        "truncate used {} sector writes: {truncate_writes:?}",
+        truncate_writes.len()
+    );
+    assert!(truncate_writes.iter().all(|(_, count)| *count == 1));
+}
+
+#[test]
+fn truncate_batches_fat32_updates_by_fat_sector() {
+    let time_source = utils::make_time_source();
+    let (disk, writes) = make_recording_device();
+    let volume_mgr: VolumeManager<_, _, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(1))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    let file = volume_mgr
+        .open_file_in_dir(root_dir, "EMPTY.DAT", Mode::ReadWriteTruncate)
+        .expect("open file");
+
+    // FAT32 has eight blocks per cluster in the test image.
+    let blocks = vec![Block::new(); 300 * 8];
+    volume_mgr
+        .write_blocks(file, &blocks)
+        .expect("write multi-sector FAT chain");
+    volume_mgr.close_file(file).expect("close file");
+
+    writes.borrow_mut().clear();
+    let file = volume_mgr
+        .open_file_in_dir(root_dir, "EMPTY.DAT", Mode::ReadWriteAppend)
+        .expect("open file for batched truncation");
+    volume_mgr
+        .truncate_file_batched(file)
+        .expect("truncate file");
+    assert_eq!(volume_mgr.file_length(file).expect("file length"), 0);
+    volume_mgr.close_file(file).expect("close truncated file");
+    assert_eq!(
+        volume_mgr
+            .find_directory_entry(root_dir, "EMPTY.DAT")
+            .expect("find truncated file")
+            .size,
+        0
+    );
+
+    let truncate_writes = writes.borrow();
+    assert!(
+        truncate_writes.len() < 16,
+        "truncate used {} sector writes: {truncate_writes:?}",
+        truncate_writes.len()
+    );
+    assert!(truncate_writes.iter().all(|(_, count)| *count == 1));
+}
+
+#[test]
+fn standard_truncate_keeps_per_cluster_write_behavior() {
+    let time_source = utils::make_time_source();
+    let (disk, writes) = make_recording_device();
+    let volume_mgr: VolumeManager<_, _, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(0))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    let file = volume_mgr
+        .open_file_in_dir(root_dir, "EMPTY.DAT", Mode::ReadWriteTruncate)
+        .expect("open file");
+    let blocks = vec![Block::new(); 32 * 4];
+    volume_mgr
+        .write_blocks(file, &blocks)
+        .expect("write cluster chain");
+    volume_mgr.close_file(file).expect("close file");
+
+    writes.borrow_mut().clear();
+    let file = volume_mgr
+        .open_file_in_dir(root_dir, "EMPTY.DAT", Mode::ReadWriteTruncate)
+        .expect("truncate through standard mode");
+    assert_eq!(volume_mgr.file_length(file).expect("file length"), 0);
+    assert!(
+        writes.borrow().len() > 32,
+        "standard truncation unexpectedly used the batched path"
+    );
+}
 // ****************************************************************************
 //
 // End Of File

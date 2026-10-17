@@ -215,6 +215,96 @@ impl FatVolume {
         }
     }
 
+    fn fat_entry_location(&self, cluster: ClusterId) -> (BlockIdx, Option<BlockIdx>, usize) {
+        let entry_size = match &self.fat_specific_info {
+            FatSpecificInfo::Fat16(_) => 2,
+            FatSpecificInfo::Fat32(_) => 4,
+        };
+        let fat_offset = cluster.0 * entry_size;
+        let block = self.lba_start + self.fat_start.offset_bytes(fat_offset);
+        let duplicate = self
+            .second_fat_start
+            .map(|start| self.lba_start + start.offset_bytes(fat_offset));
+        (block, duplicate, (fat_offset % Block::LEN_U32) as usize)
+    }
+
+    fn validate_data_cluster<E>(&self, cluster: ClusterId) -> Result<ClusterId, Error<E>>
+    where
+        E: core::fmt::Debug,
+    {
+        let end = RESERVED_ENTRIES
+            .checked_add(self.cluster_count)
+            .ok_or(Error::FormatError("invalid FAT cluster count"))?;
+        if cluster.0 < RESERVED_ENTRIES || cluster.0 >= end {
+            return Err(Error::FormatError("cluster outside data region"));
+        }
+        Ok(cluster)
+    }
+
+    fn next_cluster_from_block<E>(
+        &self,
+        block: &Block,
+        offset: usize,
+    ) -> Result<Option<ClusterId>, Error<E>>
+    where
+        E: core::fmt::Debug,
+    {
+        match &self.fat_specific_info {
+            FatSpecificInfo::Fat16(_) => {
+                let entry = LittleEndian::read_u16(&block[offset..=offset + 1]);
+                match entry {
+                    0x0000 => Err(Error::UnterminatedFatChain),
+                    0x0001 | 0xFFF0..=0xFFF6 => {
+                        Err(Error::FormatError("reserved FAT16 cluster in chain"))
+                    }
+                    0xFFF7 => Err(Error::BadCluster),
+                    0xFFF8..=0xFFFF => Ok(None),
+                    value => self
+                        .validate_data_cluster(ClusterId(u32::from(value)))
+                        .map(Some),
+                }
+            }
+            FatSpecificInfo::Fat32(_) => {
+                let entry = LittleEndian::read_u32(&block[offset..=offset + 3]) & 0x0FFF_FFFF;
+                match entry {
+                    0x0000_0000 => Err(Error::UnterminatedFatChain),
+                    0x0000_0001 | 0x0FFF_FFF0..=0x0FFF_FFF6 => {
+                        Err(Error::FormatError("reserved FAT32 cluster in chain"))
+                    }
+                    0x0FFF_FFF7 => Err(Error::BadCluster),
+                    0x0FFF_FFF8..=0x0FFF_FFFF => Ok(None),
+                    value => self.validate_data_cluster(ClusterId(value)).map(Some),
+                }
+            }
+        }
+    }
+
+    fn write_fat_entry_to_block(&self, block: &mut Block, offset: usize, value: ClusterId) {
+        match &self.fat_specific_info {
+            FatSpecificInfo::Fat16(_) => {
+                let entry = match value {
+                    ClusterId::INVALID => 0xFFF6,
+                    ClusterId::BAD => 0xFFF7,
+                    ClusterId::EMPTY => 0x0000,
+                    ClusterId::END_OF_FILE => 0xFFFF,
+                    _ => value.0 as u16,
+                };
+                LittleEndian::write_u16(&mut block[offset..=offset + 1], entry);
+            }
+            FatSpecificInfo::Fat32(_) => {
+                let entry = match value {
+                    ClusterId::INVALID => 0x0FFF_FFF6,
+                    ClusterId::BAD => 0x0FFF_FFF7,
+                    ClusterId::EMPTY => 0x0000_0000,
+                    _ => value.0,
+                };
+                let existing = LittleEndian::read_u32(&block[offset..=offset + 3]);
+                let new = (existing & 0xF000_0000) | (entry & 0x0FFF_FFFF);
+                LittleEndian::write_u32(&mut block[offset..=offset + 3], new);
+            }
+        }
+    }
+
     /// Write a new entry in the FAT
     async fn update_fat<D>(
         &mut self,
@@ -1254,6 +1344,111 @@ impl FatVolume {
             if let Some(ref mut number_free_cluster) = self.free_clusters_count {
                 *number_free_cluster += 1;
             };
+        }
+        Ok(())
+    }
+
+    /// Batched variant of [`Self::truncate_cluster_chain`] that writes each
+    /// modified FAT sector once instead of once per cluster entry.
+    pub(crate) async fn truncate_cluster_chain_batched<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        cluster: ClusterId,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        if cluster.0 < RESERVED_ENTRIES {
+            // file doesn't have any valid cluster allocated, there is nothing to do
+            return Ok(());
+        }
+        self.validate_data_cluster::<D::Error>(cluster)?;
+
+        let mut current = cluster;
+        let mut clusters_left = self.cluster_count;
+        let mut processing_first_entry = true;
+        let mut first_freed_cluster = None;
+        let mut next_free_cluster_updated = false;
+
+        loop {
+            let (fat_block_idx, duplicate_fat_block_idx, _) = self.fat_entry_location(current);
+            let mut fat_block = block_cache
+                .read(fat_block_idx)
+                .await
+                .map_err(Error::DeviceError)?
+                .clone();
+            let mut freed_in_block = 0_u32;
+            let mut finished = false;
+
+            loop {
+                let (entry_block_idx, _, entry_offset) = self.fat_entry_location(current);
+                if entry_block_idx != fat_block_idx {
+                    break;
+                }
+                if clusters_left == 0 {
+                    return Err(Error::FormatError("cluster chain exceeds volume"));
+                }
+                clusters_left -= 1;
+
+                let next = self.next_cluster_from_block::<D::Error>(&fat_block, entry_offset)?;
+                if processing_first_entry {
+                    let Some(next) = next else {
+                        return Ok(());
+                    };
+                    self.write_fat_entry_to_block(
+                        &mut fat_block,
+                        entry_offset,
+                        ClusterId::END_OF_FILE,
+                    );
+                    processing_first_entry = false;
+                    first_freed_cluster = Some(next);
+                    current = next;
+                } else {
+                    self.write_fat_entry_to_block(&mut fat_block, entry_offset, ClusterId::EMPTY);
+                    freed_in_block += 1;
+                    match next {
+                        Some(next) => current = next,
+                        None => finished = true,
+                    }
+                }
+
+                if finished {
+                    break;
+                }
+            }
+
+            let blocks = [fat_block];
+            let block_device = block_cache.block_device();
+            block_device
+                .write(&blocks, fat_block_idx)
+                .await
+                .map_err(Error::DeviceError)?;
+            if let Some(duplicate_fat_block_idx) = duplicate_fat_block_idx {
+                block_device
+                    .write(&blocks, duplicate_fat_block_idx)
+                    .await
+                    .map_err(Error::DeviceError)?;
+            }
+
+            if !next_free_cluster_updated {
+                let first_freed_cluster =
+                    first_freed_cluster.ok_or(Error::FormatError("missing first freed cluster"))?;
+                if let Some(ref mut next_free_cluster) = self.next_free_cluster {
+                    if next_free_cluster.0 > first_freed_cluster.0 {
+                        *next_free_cluster = first_freed_cluster;
+                    }
+                } else {
+                    self.next_free_cluster = Some(first_freed_cluster);
+                }
+                next_free_cluster_updated = true;
+            }
+            if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+                *number_free_cluster += freed_in_block;
+            };
+
+            if finished {
+                break;
+            }
         }
         Ok(())
     }

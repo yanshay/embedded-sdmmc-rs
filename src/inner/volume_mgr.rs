@@ -1111,6 +1111,48 @@ where
         Ok(())
     }
 
+    /// Truncate an open file using batched FAT-sector updates.
+    ///
+    /// This is an opt-in alternative to opening a file with
+    /// [`Mode::ReadWriteTruncate`]. Existing truncation callers retain the
+    /// original per-cluster write behavior.
+    pub async fn truncate_file_batched(&self, file: RawFile) -> Result<(), Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let file_idx = data.get_file_by_id(file)?;
+        if data.open_files[file_idx].mode == Mode::ReadOnly {
+            return Err(Error::ReadOnly);
+        }
+        let volume_idx = data.get_volume_by_id(data.open_files[file_idx].raw_volume)?;
+        let first_cluster = data.open_files[file_idx].entry.cluster;
+        data.open_files[file_idx].update_length(0);
+        data.open_files[file_idx]
+            .seek_from_start(0)
+            .map_err(|_| Error::InvalidOffset)?;
+        data.open_files[file_idx].current_cluster = (0, first_cluster);
+        data.open_files[file_idx].entry.mtime = self.time_source.get_timestamp();
+        data.open_files[file_idx].dirty = true;
+        let entry = data.open_files[file_idx].entry.clone();
+
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.write_entry_to_disk(&mut data.block_cache, &entry)
+                    .await?
+            }
+        }
+
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.truncate_cluster_chain_batched(&mut data.block_cache, first_cluster)
+                    .await?;
+                fat.update_info_sector(&mut data.block_cache).await?;
+            }
+        }
+        data.open_files[file_idx].dirty = false;
+        Ok(())
+    }
+
     /// Close a file with the given raw file handle.
     pub async fn close_file(&self, file: RawFile) -> Result<(), Error<D::Error>> {
         let flush_result = self.flush_file(file).await;
